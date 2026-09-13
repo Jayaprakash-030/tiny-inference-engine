@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Headless benchmark runner. No notebook state, so this works over SSH.
+
+  python scripts/run_benchmark.py --milestone 1 2 --max-new-tokens 400
+  python scripts/run_benchmark.py --milestone 3 --batch-sizes 1 2 4 8 16 32
+"""
+
+import argparse
+
+from engine import load
+from engine.batched import check_batch_matches_single, sweep
+from engine.cached import check_matches_naive, measure_cached
+from engine.naive import measure_naive, warmup
+from engine.prompts import BATCH, LONG, SHORT
+from engine.results import report, save
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--milestone", type=int, nargs="+", default=[1, 2, 3])
+    ap.add_argument("--max-new-tokens", type=int, default=400)
+    ap.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32])
+    ap.add_argument("--model", default=None)
+    ap.add_argument("--out", default="benchmarks/results.json")
+    ap.add_argument("--skip-checks", action="store_true")
+    args = ap.parse_args()
+
+    rt = load(args.model) if args.model else load()
+    rt.describe()
+    print()
+
+    warmup(rt, SHORT)
+    results = []
+
+    if 1 in args.milestone:
+        print("=== milestone 1: naive loop ===")
+        for label, prompt in [("short_prompt", SHORT), ("long_prompt", LONG)]:
+            results.append(report(measure_naive(rt, label, prompt, args.max_new_tokens)))
+
+    if 2 in args.milestone:
+        print("=== milestone 2: kv cache ===")
+        if not args.skip_checks:
+            assert check_matches_naive(rt, SHORT), "cache diverged from naive"
+            assert check_matches_naive(rt, LONG), "cache diverged from naive"
+        for label, prompt in [("short_prompt", SHORT), ("long_prompt", LONG)]:
+            results.append(report(measure_cached(rt, label, prompt, args.max_new_tokens)))
+
+    if 3 in args.milestone:
+        print("=== milestone 3: static batching ===")
+        if not args.skip_checks:
+            assert check_batch_matches_single(rt, BATCH[:4]), "batching diverged"
+        results.extend(sweep(rt, args.batch_sizes, args.max_new_tokens))
+
+    save(results, args.out)
+
+
+if __name__ == "__main__":
+    main()

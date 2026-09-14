@@ -3,6 +3,12 @@ name = "tiny-inference-engine"
 version = "0.1.0"
 description = "An LLM inference engine built from scratch, one optimization at a time"
 requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.2",
+    "transformers>=4.51",
+    "accelerate>=0.30",
+    "matplotlib>=3.7",
+]
 
 [build-system]
 requires = ["setuptools>=68"]

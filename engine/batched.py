@@ -93,6 +93,55 @@ def batched_generate(rt: Runtime, prompts: list[str], max_new_tokens: int = 200)
     return torch.cat(generated, dim=-1), step_ms, tokens_kept, tokens_computed
 
 
+def generation_lengths(out: torch.Tensor, eos_id: int, max_new_tokens: int) -> dict:
+    """Per-sequence how many tokens were produced, and why each stopped.
+
+    CAP  = ran to steps_run without ever emitting EOS (cap is binding if
+           steps_run == max_new_tokens).
+    EOS  = emitted eos_id; gen_tokens counts up to and including that token.
+    """
+    steps_run = out.shape[1]
+    gen_tokens = []
+    stopped = []
+    for row in out:
+        ids = row.tolist()
+        if eos_id in ids:
+            gen_tokens.append(ids.index(eos_id) + 1)
+            stopped.append("EOS")
+        else:
+            gen_tokens.append(steps_run)
+            stopped.append("CAP")
+
+    return {
+        "steps_run": steps_run,
+        "max_new_tokens": max_new_tokens,
+        "hit_cap": steps_run >= max_new_tokens,
+        "gen_tokens": gen_tokens,
+        "stopped": stopped,
+        "n_hit_eos": sum(s == "EOS" for s in stopped),
+        "n_hit_cap": sum(s == "CAP" for s in stopped),
+        "min_gen_tokens": min(gen_tokens),
+        "max_gen_tokens": max(gen_tokens),
+    }
+
+
+def print_generations(rt: Runtime, prompts: list[str], out: torch.Tensor,
+                      max_new_tokens: int, preview: int = 120) -> dict:
+    """Print each prompt's gen length, stop reason, and a short decode preview."""
+    stats = generation_lengths(out, rt.tokenizer.eos_token_id, max_new_tokens)
+    print(f"steps_run={stats['steps_run']}/{max_new_tokens}  "
+          f"hit_cap={stats['hit_cap']}  "
+          f"eos={stats['n_hit_eos']}/{len(prompts)}  "
+          f"cap={stats['n_hit_cap']}/{len(prompts)}")
+    for i, p in enumerate(prompts):
+        n = stats["gen_tokens"][i]
+        reason = stats["stopped"][i]
+        text = rt.tokenizer.decode(out[i, :n], skip_special_tokens=True)
+        print(f"  [{i}] gen_tokens={n:>4}  stopped={reason}  {p[:40]!r}")
+        print(f"       {text[:preview]!r}")
+    return stats
+
+
 def check_batch_matches_single(rt: Runtime, prompts: list[str], n: int = 32) -> bool:
     """A sequence inside a batch must produce exactly what it produces alone.
 
@@ -119,7 +168,9 @@ def check_batch_matches_single(rt: Runtime, prompts: list[str], n: int = 32) -> 
 
 def measure_batch(rt: Runtime, batch_size: int, max_new_tokens: int = 200) -> dict:
     rt.reset_mem()
-    _, step_ms, kept, computed = batched_generate(rt, batch_of(batch_size), max_new_tokens)
+    prompts = batch_of(batch_size)
+    out, step_ms, kept, computed = batched_generate(rt, prompts, max_new_tokens)
+    lengths = generation_lengths(out, rt.tokenizer.eos_token_id, max_new_tokens)
 
     decode_ms = step_ms[1:]
     total_s = sum(step_ms) / 1000
@@ -130,8 +181,15 @@ def measure_batch(rt: Runtime, batch_size: int, max_new_tokens: int = 200) -> di
         "label": f"batch_{batch_size}",
         "batch_size": batch_size,
         "steps": n_steps,
+        "max_new_tokens": max_new_tokens,
+        "hit_cap": lengths["hit_cap"],
+        "n_hit_eos": lengths["n_hit_eos"],
+        "n_hit_cap": lengths["n_hit_cap"],
+        "min_gen_tokens": lengths["min_gen_tokens"],
+        "max_gen_tokens": lengths["max_gen_tokens"],
+        "gen_tokens": lengths["gen_tokens"],
         "prefill_ms": round(step_ms[0], 2),
-        "decode_median_ms": round(statistics.median(decode_ms), 2),
+        "decode_median_ms": round(statistics.median(decode_ms), 2) if decode_ms else None,
         # Throughput: useful tokens only, per second of wall clock.
         "tokens_per_sec": round(kept / total_s, 2),
         # What each sequence experiences, regardless of batch size.
@@ -154,5 +212,9 @@ def sweep(rt: Runtime, sizes=(1, 2, 4, 8, 16, 32), max_new_tokens: int = 200) ->
         results.append(r)
         print(f"batch {bs:>2}: {r['tokens_per_sec']:>8} tok/s total, "
               f"{r['per_seq_tok_per_sec']:>6} per seq, "
-              f"{r['wasted_slot_pct']:>5}% wasted, {r['peak_mem_gb']} GB")
+              f"{r['wasted_slot_pct']:>5}% wasted, "
+              f"steps {r['steps']}/{max_new_tokens}, "
+              f"eos {r['n_hit_eos']}/{bs}, "
+              f"gen {r['min_gen_tokens']}-{r['max_gen_tokens']}, "
+              f"{r['peak_mem_gb']} GB")
     return results

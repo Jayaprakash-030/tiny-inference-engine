@@ -12,6 +12,11 @@ Three things change from cached_generate:
   3. position_ids must be passed explicitly. With left padding a sequence's
      first real token is not at index 0, and calling the model directly skips
      the helper that would normally work this out.
+
+Greedy Qwen rarely emits EOS on open prompts, so a shared max_new_tokens makes
+every sequence run to the same length and wasted_slot_pct stays ~0. Real serving
+gives each request its own max_tokens; staggered per-seq limits recreate that
+finish-time skew so static-batching waste shows up (milestone 4's motivation).
 """
 
 import statistics
@@ -24,14 +29,52 @@ from engine.model import Runtime
 from engine.prompts import batch_of
 
 
+def staggered_limits(batch_size: int, max_new_tokens: int) -> list[int]:
+    """Spread stop lengths across the batch: short requests finish early.
+
+    batch_size=4, max_new_tokens=200 → [50, 100, 150, 200]
+    """
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if batch_size == 1:
+        return [max_new_tokens]
+    return [max(1, round(max_new_tokens * (i + 1) / batch_size)) for i in range(batch_size)]
+
+
+def _resolve_limits(
+    batch_size: int,
+    max_new_tokens: int,
+    max_new_tokens_per_seq: list[int] | None,
+    device: torch.device,
+) -> torch.Tensor:
+    if max_new_tokens_per_seq is None:
+        limits = [max_new_tokens] * batch_size
+    else:
+        if len(max_new_tokens_per_seq) != batch_size:
+            raise ValueError(
+                f"max_new_tokens_per_seq length {len(max_new_tokens_per_seq)} "
+                f"!= batch_size {batch_size}"
+            )
+        limits = [max(1, int(x)) for x in max_new_tokens_per_seq]
+    return torch.tensor(limits, device=device, dtype=torch.long)
+
+
 @torch.inference_mode()
-def batched_generate(rt: Runtime, prompts: list[str], max_new_tokens: int = 200):
+def batched_generate(
+    rt: Runtime,
+    prompts: list[str],
+    max_new_tokens: int = 200,
+    max_new_tokens_per_seq: list[int] | None = None,
+):
     # Left padding is mandatory: decode appends at the END of each sequence, so
     # every sequence's next-token slot must line up at the same index.
     enc = rt.tokenizer(prompts, return_tensors="pt", padding=True)
     ids = enc.input_ids.to(rt.device)
     mask = enc.attention_mask.to(rt.device)
     batch_size = ids.shape[0]
+
+    limits = _resolve_limits(batch_size, max_new_tokens, max_new_tokens_per_seq, rt.device)
+    max_steps = int(limits.max().item())
 
     step_ms = []
     generated = []
@@ -54,14 +97,18 @@ def batched_generate(rt: Runtime, prompts: list[str], max_new_tokens: int = 200)
     step_ms.append((time.perf_counter() - t0) * 1000)
 
     generated.append(next_ids.clone())
+    n_gen = 1
     finished |= next_ids.squeeze(-1) == rt.tokenizer.eos_token_id
+    finished |= n_gen >= limits
     tokens_kept += batch_size
     tokens_computed += batch_size
 
     next_pos = mask.sum(-1, keepdim=True)
 
     # --- DECODE ---
-    for _ in range(max_new_tokens - 1):
+    # Loop to the longest per-seq limit. Short sequences stay in the batch
+    # (static) but stop counting as kept once finished.
+    while n_gen < max_steps:
         if finished.all():
             break
 
@@ -87,57 +134,84 @@ def batched_generate(rt: Runtime, prompts: list[str], max_new_tokens: int = 200)
         tokens_kept += int((~finished).sum())
 
         generated.append(next_ids.clone())
+        n_gen += 1
         finished |= next_ids.squeeze(-1) == rt.tokenizer.eos_token_id
+        finished |= n_gen >= limits
         next_pos = next_pos + 1
 
     return torch.cat(generated, dim=-1), step_ms, tokens_kept, tokens_computed
 
 
-def generation_lengths(out: torch.Tensor, eos_id: int, max_new_tokens: int) -> dict:
-    """Per-sequence how many tokens were produced, and why each stopped.
+def generation_lengths(
+    out: torch.Tensor,
+    eos_id: int,
+    max_new_tokens: int,
+    limits: list[int] | None = None,
+) -> dict:
+    """Per-sequence how many *useful* tokens were produced, and why each stopped.
 
-    CAP  = ran to steps_run without ever emitting EOS (cap is binding if
-           steps_run == max_new_tokens).
-    EOS  = emitted eos_id; gen_tokens counts up to and including that token.
+    EOS    — model emitted eos_id at or before the seq limit
+    LIMIT  — hit this sequence's max_new_tokens_per_seq (finish-time skew)
+    CAP    — ran to the shared/global budget with no earlier stop
     """
     steps_run = out.shape[1]
     gen_tokens = []
     stopped = []
-    for row in out:
+    for i, row in enumerate(out):
         ids = row.tolist()
-        if eos_id in ids:
-            gen_tokens.append(ids.index(eos_id) + 1)
+        limit_i = int(limits[i]) if limits is not None else max_new_tokens
+        eos_at = (ids.index(eos_id) + 1) if eos_id in ids else None
+
+        if eos_at is not None and eos_at <= limit_i:
+            gen_tokens.append(eos_at)
             stopped.append("EOS")
+        elif limits is not None and limit_i < steps_run:
+            gen_tokens.append(min(limit_i, steps_run))
+            stopped.append("LIMIT")
+        elif limits is not None and limit_i <= steps_run and limit_i < max_new_tokens:
+            gen_tokens.append(limit_i)
+            stopped.append("LIMIT")
         else:
-            gen_tokens.append(steps_run)
+            gen_tokens.append(min(steps_run, limit_i))
             stopped.append("CAP")
 
     return {
         "steps_run": steps_run,
         "max_new_tokens": max_new_tokens,
-        "hit_cap": steps_run >= max_new_tokens,
+        "limits": list(limits) if limits is not None else None,
+        "hit_cap": steps_run >= max_new_tokens and all(s == "CAP" for s in stopped),
         "gen_tokens": gen_tokens,
         "stopped": stopped,
         "n_hit_eos": sum(s == "EOS" for s in stopped),
+        "n_hit_limit": sum(s == "LIMIT" for s in stopped),
         "n_hit_cap": sum(s == "CAP" for s in stopped),
         "min_gen_tokens": min(gen_tokens),
         "max_gen_tokens": max(gen_tokens),
     }
 
 
-def print_generations(rt: Runtime, prompts: list[str], out: torch.Tensor,
-                      max_new_tokens: int, preview: int = 120) -> dict:
+def print_generations(
+    rt: Runtime,
+    prompts: list[str],
+    out: torch.Tensor,
+    max_new_tokens: int,
+    limits: list[int] | None = None,
+    preview: int = 120,
+) -> dict:
     """Print each prompt's gen length, stop reason, and a short decode preview."""
-    stats = generation_lengths(out, rt.tokenizer.eos_token_id, max_new_tokens)
+    stats = generation_lengths(out, rt.tokenizer.eos_token_id, max_new_tokens, limits)
     print(f"steps_run={stats['steps_run']}/{max_new_tokens}  "
-          f"hit_cap={stats['hit_cap']}  "
           f"eos={stats['n_hit_eos']}/{len(prompts)}  "
+          f"limit={stats['n_hit_limit']}/{len(prompts)}  "
           f"cap={stats['n_hit_cap']}/{len(prompts)}")
+    if limits is not None:
+        print(f"per-seq limits: {limits}")
     for i, p in enumerate(prompts):
         n = stats["gen_tokens"][i]
         reason = stats["stopped"][i]
         text = rt.tokenizer.decode(out[i, :n], skip_special_tokens=True)
-        print(f"  [{i}] gen_tokens={n:>4}  stopped={reason}  {p[:40]!r}")
+        lim = f" limit={limits[i]}" if limits is not None else ""
+        print(f"  [{i}] gen_tokens={n:>4}  stopped={reason}{lim}  {p[:40]!r}")
         print(f"       {text[:preview]!r}")
     return stats
 
@@ -146,6 +220,7 @@ def check_batch_matches_single(rt: Runtime, prompts: list[str], n: int = 32) -> 
     """A sequence inside a batch must produce exactly what it produces alone.
 
     If padding or position_ids are wrong, output degrades silently.
+    Uses a uniform cap (no stagger) so the comparison is fair.
     """
     batch_out, _, _, _ = batched_generate(rt, prompts, max_new_tokens=n)
 
@@ -166,11 +241,24 @@ def check_batch_matches_single(rt: Runtime, prompts: list[str], n: int = 32) -> 
     return all_ok
 
 
-def measure_batch(rt: Runtime, batch_size: int, max_new_tokens: int = 200) -> dict:
+def measure_batch(
+    rt: Runtime,
+    batch_size: int,
+    max_new_tokens: int = 200,
+    stagger: bool = True,
+) -> dict:
+    """Benchmark one batch size.
+
+    stagger=True (default): each sequence gets a different max length so some
+    finish early and wasted_slot_pct is non-zero — the static-batching story.
+    """
     rt.reset_mem()
     prompts = batch_of(batch_size)
-    out, step_ms, kept, computed = batched_generate(rt, prompts, max_new_tokens)
-    lengths = generation_lengths(out, rt.tokenizer.eos_token_id, max_new_tokens)
+    limits = staggered_limits(batch_size, max_new_tokens) if stagger else None
+    out, step_ms, kept, computed = batched_generate(
+        rt, prompts, max_new_tokens, max_new_tokens_per_seq=limits,
+    )
+    lengths = generation_lengths(out, rt.tokenizer.eos_token_id, max_new_tokens, limits)
 
     decode_ms = step_ms[1:]
     total_s = sum(step_ms) / 1000
@@ -182,8 +270,11 @@ def measure_batch(rt: Runtime, batch_size: int, max_new_tokens: int = 200) -> di
         "batch_size": batch_size,
         "steps": n_steps,
         "max_new_tokens": max_new_tokens,
+        "stagger": stagger,
+        "limits": limits,
         "hit_cap": lengths["hit_cap"],
         "n_hit_eos": lengths["n_hit_eos"],
+        "n_hit_limit": lengths["n_hit_limit"],
         "n_hit_cap": lengths["n_hit_cap"],
         "min_gen_tokens": lengths["min_gen_tokens"],
         "max_gen_tokens": lengths["max_gen_tokens"],
@@ -199,12 +290,17 @@ def measure_batch(rt: Runtime, batch_size: int, max_new_tokens: int = 200) -> di
     }
 
 
-def sweep(rt: Runtime, sizes=(1, 2, 4, 8, 16, 32), max_new_tokens: int = 200) -> list[dict]:
+def sweep(
+    rt: Runtime,
+    sizes=(1, 2, 4, 8, 16, 32),
+    max_new_tokens: int = 200,
+    stagger: bool = True,
+) -> list[dict]:
     """Stop at the first OOM — hitting the memory ceiling is a result, not a failure."""
     results = []
     for bs in sizes:
         try:
-            r = measure_batch(rt, bs, max_new_tokens)
+            r = measure_batch(rt, bs, max_new_tokens, stagger=stagger)
         except torch.cuda.OutOfMemoryError:
             print(f"batch {bs}: OOM — memory ceiling reached")
             torch.cuda.empty_cache()
@@ -214,7 +310,7 @@ def sweep(rt: Runtime, sizes=(1, 2, 4, 8, 16, 32), max_new_tokens: int = 200) ->
               f"{r['per_seq_tok_per_sec']:>6} per seq, "
               f"{r['wasted_slot_pct']:>5}% wasted, "
               f"steps {r['steps']}/{max_new_tokens}, "
-              f"eos {r['n_hit_eos']}/{bs}, "
+              f"limit {r['n_hit_limit']}/{bs}, "
               f"gen {r['min_gen_tokens']}-{r['max_gen_tokens']}, "
               f"{r['peak_mem_gb']} GB")
     return results

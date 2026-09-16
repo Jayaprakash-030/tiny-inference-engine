@@ -292,11 +292,14 @@ def measure_batch(
 
 def sweep(
     rt: Runtime,
-    sizes=(1, 2, 4, 8, 16, 32),
+    sizes=(1, 2, 4, 8, 16, 32, 64, 128, 256),
     max_new_tokens: int = 200,
     stagger: bool = True,
 ) -> list[dict]:
-    """Stop at the first OOM — hitting the memory ceiling is a result, not a failure."""
+    """Stop at the first OOM — hitting the memory ceiling is a result, not a failure.
+
+    Default sizes run past 32 so the throughput curve can flatten (or OOM).
+    """
     results = []
     for bs in sizes:
         try:

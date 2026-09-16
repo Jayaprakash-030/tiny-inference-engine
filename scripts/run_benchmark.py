@@ -2,7 +2,7 @@
 """Headless benchmark runner. No notebook state, so this works over SSH.
 
   python scripts/run_benchmark.py --milestone 1 2 --max-new-tokens 400
-  python scripts/run_benchmark.py --milestone 3 --batch-sizes 1 2 4 8 16 32
+  python scripts/run_benchmark.py --milestone 3 --batch-sizes 1 2 4 8 16 32 64 128 256
 """
 
 import argparse
@@ -19,7 +19,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--milestone", type=int, nargs="+", default=[1, 2, 3])
     ap.add_argument("--max-new-tokens", type=int, default=400)
-    ap.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32])
+    ap.add_argument("--batch-sizes", type=int, nargs="+",
+                    default=[1, 2, 4, 8, 16, 32, 64, 128, 256])
     ap.add_argument("--model", default=None)
     ap.add_argument("--out", default="benchmarks/results.json")
     ap.add_argument("--skip-checks", action="store_true")

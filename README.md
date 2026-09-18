@@ -49,7 +49,13 @@ the longest sequence in the batch ends.
 *Results: TODO*
 
 ### 4. Continuous batching
-*Not started.* Evict finished sequences mid-flight and admit waiting ones.
+Iteration-level scheduling: evict finished sequences mid-flight and admit waiting
+ones into free slots. Same arrival workload is served with static waves and with
+continuous scheduling; compare tok/s, wait, latency, and slot utilization.
+
+  python scripts/run_benchmark.py --milestone 4 --slot-sizes 2 4 8 16 --n-requests 32
+
+*Results: see benchmarks/results.json (milestone 4 rows) and notebooks/04_continuous_batching.ipynb*
 
 ### 5. Paged KV cache
 *Not started.* Fixed-size blocks and a block table, instead of one contiguous

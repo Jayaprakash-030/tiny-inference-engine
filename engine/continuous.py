@@ -584,6 +584,25 @@ def print_pair(static_d: dict, cont_d: dict) -> None:
     line("continuous", cont_d)
 
 
+def sweep_continuous(
+    rt: Runtime,
+    slot_sizes=(2, 4, 8, 16),
+    n_requests: int = 32,
+    max_new_tokens: int = 200,
+    arrival_rate_hz: float = 8.0,
+    seed: int = 0,
+) -> list[dict]:
+    """Compare static vs continuous across slot budgets; returns rows for save()."""
+    results: list[dict] = []
+    for slots in slot_sizes:
+        static_d, cont_d = measure_pair(
+            rt, n_requests, slots, max_new_tokens, arrival_rate_hz, seed,
+        )
+        print_pair(static_d, cont_d)
+        results.extend([static_d, cont_d])
+    return results
+
+
 def check_continuous_one_matches_run_one(
     rt: Runtime, prompt: str = BATCH[0], n: int = 32,
 ) -> bool:

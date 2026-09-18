@@ -136,9 +136,12 @@ class BlockPool:
         slot = self.filled[bid]
         if slot >= self.block_size:
             raise RuntimeError(f"block {bid} is full")
+        # Important: do NOT use [:, :, -1:0, :] — in Python that slice is empty.
+        L = cache.layers[0].keys.shape[2]
+        idx = pos if pos >= 0 else L + pos
         for li, layer in enumerate(cache.layers):
-            self.keys[bid][li][:, :, slot : slot + 1, :] = layer.keys[:, :, pos : pos + 1, :]
-            self.values[bid][li][:, :, slot : slot + 1, :] = layer.values[:, :, pos : pos + 1, :]
+            self.keys[bid][li][:, :, slot : slot + 1, :] = layer.keys[:, :, idx : idx + 1, :]
+            self.values[bid][li][:, :, slot : slot + 1, :] = layer.values[:, :, idx : idx + 1, :]
         self.filled[bid] = slot + 1
 
     def gather_to_cache(self, table: list[int], seq_len: int) -> DynamicCache:

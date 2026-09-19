@@ -2,6 +2,7 @@
 
 Block 1: fixed-size block allocator (ids + free list).
 Block 2: store real K/V in those blocks; gather → HF forward → scatter new token.
+Block 3: shared pool budget — reserved (worst-case) vs paged (grow as you go).
 
 We still call Hugging Face for the math. Paging owns *where* K/V live; before
 each decode we gather the sequence's blocks into a temporary contiguous
@@ -12,6 +13,7 @@ pool (allocating a new block when the last one is full).
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 
 import torch
@@ -222,13 +224,17 @@ class BlockTable:
     def append_kv_from_cache(self, cache: DynamicCache) -> None:
         """After a decode step, store the newest token (last position) into the pool."""
         self.ensure_capacity(self.seq_len + 1)
-        last_bid = self.table[-1]
-        # If the previous last block was full, ensure_capacity just appended a fresh id.
-        if self.pool.filled[last_bid] >= self.pool.block_size:
+        # Next token lands in logical block index seq_len // block_size — NOT
+        # always table[-1]. Reserved mode pre-allocates empty tail blocks, so
+        # the last table entry may be an unused future block.
+        bi = self.seq_len // self.pool.block_size
+        bid = self.table[bi]
+        if self.pool.filled[bid] >= self.pool.block_size:
             raise RuntimeError(
-                f"last block {last_bid} still full after ensure_capacity; table={self.table}"
+                f"block {bid} (logical {bi}) full at seq_len={self.seq_len}; "
+                f"table={self.table} filled={self.pool.filled[bid]}"
             )
-        self.pool.append_token_kv(last_bid, cache, pos=-1)
+        self.pool.append_token_kv(bid, cache, pos=-1)
         self.seq_len += 1
 
 
@@ -305,6 +311,254 @@ def check_paged_matches_cached(
     return same
 
 
+# ---------------------------------------------------------------------------
+# Block 3 — memory budget: reserved (worst-case) vs paged (grow as you go)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _Live:
+    """One in-flight request under a shared BlockPool."""
+
+    req: object  # continuous.Request
+    bt: BlockTable
+    next_id: torch.Tensor
+    tokens: list[int]
+    n_gen: int
+    prompt_len: int
+
+
+def _prompt_len(rt: Runtime, prompt: str) -> int:
+    return rt.tokenizer(prompt, return_tensors="pt").input_ids.shape[1]
+
+
+def reserved_blocks_needed(prompt_len: int, max_new_tokens: int,
+                           block_size: int = BLOCK_SIZE) -> int:
+    """Pre-vLLM style: reserve for prompt + full max output up front."""
+    return blocks_needed(prompt_len + max_new_tokens, block_size)
+
+
+def paged_prefill_blocks_needed(prompt_len: int, block_size: int = BLOCK_SIZE) -> int:
+    """Paged admit only needs room for the prompt KV (grows later on decode)."""
+    return blocks_needed(prompt_len, block_size)
+
+
+@torch.inference_mode()
+def serve_with_block_budget(
+    rt: Runtime,
+    requests: list,
+    n_blocks: int,
+    mode: str = "paged",
+    block_size: int = BLOCK_SIZE,
+    max_slots: int | None = None,
+) -> dict:
+    """Run continuous-style admit/decode/evict under a fixed block pool.
+
+    mode="reserved": on admit, allocate blocks for prompt+max_new immediately
+                     (empty tail held so nobody else can use them).
+    mode="paged":    on admit, allocate only what prefill needs; grow one block
+                     at a time during decode; free everything on finish.
+
+    Requests that cannot be admitted when they arrive are rejected (not queued
+    forever) so the metric is "how many fit in this budget".
+    """
+    if mode not in ("paged", "reserved"):
+        raise ValueError("mode must be 'paged' or 'reserved'")
+
+    from engine.continuous import Request  # local import: avoid cycle at module load
+
+    pool = BlockPool(n_blocks=n_blocks, block_size=block_size)
+    eos = rt.tokenizer.eos_token_id
+    waiting = sorted(requests, key=lambda r: (r.arrival_ms, r.req_id))
+    active: list[_Live] = []
+    completed: list[dict] = []
+    rejected: list[dict] = []
+
+    server_ms = 0.0
+    peak_used = 0
+    peak_concurrent = 0
+    qi = 0
+    slot_cap = max_slots if max_slots is not None else n_blocks  # soft cap
+
+    if waiting:
+        server_ms = max(server_ms, waiting[0].arrival_ms)
+
+    def _note_peaks():
+        nonlocal peak_used, peak_concurrent
+        peak_used = max(peak_used, pool.n_used)
+        peak_concurrent = max(peak_concurrent, len(active))
+
+    def _try_admit(req: Request) -> bool:
+        """Prefill + place into active, or reject if the budget cannot fit."""
+        nonlocal server_ms
+        plen = _prompt_len(rt, req.prompt)
+        if mode == "reserved":
+            need = reserved_blocks_needed(plen, req.max_new_tokens, block_size)
+        else:
+            need = paged_prefill_blocks_needed(plen, block_size)
+
+        if pool.n_free < need or len(active) >= slot_cap:
+            return False
+
+        rt.sync()
+        t0 = time.perf_counter()
+        ids = rt.tokenizer(req.prompt, return_tensors="pt").input_ids.to(rt.device)
+        out = rt.model(input_ids=ids, use_cache=True)
+        next_id = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        rt.sync()
+        server_ms += (time.perf_counter() - t0) * 1000
+
+        bt = BlockTable(pool)
+        bt.ingest_from_cache(out.past_key_values)
+        # Reserved: pin blocks for the worst-case final length now.
+        if mode == "reserved":
+            bt.ensure_capacity(plen + req.max_new_tokens)
+
+        live = _Live(
+            req=req,
+            bt=bt,
+            next_id=next_id,
+            tokens=[int(next_id.item())],
+            n_gen=1,
+            prompt_len=plen,
+        )
+        if live.tokens[-1] == eos or live.n_gen >= req.max_new_tokens:
+            completed.append({
+                "req_id": req.req_id,
+                "gen_tokens": live.n_gen,
+                "blocks_used": live.bt.n_blocks,
+            })
+            live.bt.release()
+        else:
+            active.append(live)
+        _note_peaks()
+        return True
+
+    def _decode_one_live(live: _Live) -> float:
+        nonlocal server_ms
+        rt.sync()
+        t0 = time.perf_counter()
+        gathered = live.bt.gather_cache()
+        out = rt.model(
+            input_ids=live.next_id,
+            past_key_values=gathered,
+            use_cache=True,
+        )
+        rt.sync()
+        dt = (time.perf_counter() - t0) * 1000
+        live.next_id = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        tok = int(live.next_id.item())
+        live.tokens.append(tok)
+        live.n_gen += 1
+        live.bt.append_kv_from_cache(out.past_key_values)
+        return dt
+
+    def _finished(live: _Live) -> bool:
+        if live.n_gen >= live.req.max_new_tokens:
+            return True
+        if live.tokens and live.tokens[-1] == eos:
+            return True
+        return False
+
+    while qi < len(waiting) or active:
+        # ADMIT
+        while qi < len(waiting) and len(active) < slot_cap:
+            req = waiting[qi]
+            if req.arrival_ms > server_ms:
+                break
+            qi += 1
+            if not _try_admit(req):
+                rejected.append({
+                    "req_id": req.req_id,
+                    "arrival_ms": req.arrival_ms,
+                    "limit": req.max_new_tokens,
+                    "reason": "oom_blocks_or_slots",
+                    "free_at_reject": pool.n_free,
+                })
+
+        if not active:
+            if qi >= len(waiting):
+                break
+            server_ms = max(server_ms, waiting[qi].arrival_ms)
+            continue
+
+        # DECODE each active seq once (sequential; memory story is what matters here)
+        for live in active:
+            server_ms += _decode_one_live(live)
+        _note_peaks()
+
+        # EVICT
+        still: list[_Live] = []
+        for live in active:
+            if _finished(live):
+                completed.append({
+                    "req_id": live.req.req_id,
+                    "gen_tokens": live.n_gen,
+                    "blocks_used": live.bt.n_blocks,
+                    "waste_slots": live.bt.waste_slots(),
+                })
+                live.bt.release()
+            else:
+                still.append(live)
+        active = still
+
+    # Anything never reached because we stopped? (shouldn't happen)
+    return {
+        "milestone": 5,
+        "label": f"{mode}_blocks_{n_blocks}",
+        "mode": mode,
+        "n_blocks": n_blocks,
+        "block_size": block_size,
+        "n_requests": len(requests),
+        "completed": len(completed),
+        "rejected": len(rejected),
+        "peak_blocks_used": peak_used,
+        "peak_concurrent": peak_concurrent,
+        "total_s": round(server_ms / 1000, 3),
+        "completions": completed,
+        "rejections": rejected,
+    }
+
+
+def compare_block_budget(
+    rt: Runtime,
+    n_blocks: int = 32,
+    n_requests: int = 16,
+    max_new_tokens: int = 64,
+    arrival_rate_hz: float = 8.0,
+    seed: int = 0,
+    block_size: int = BLOCK_SIZE,
+) -> tuple[dict, dict]:
+    """Same workload + same pool size: reserved vs paged admission."""
+    from engine.continuous import make_workload, print_workload
+
+    workload = make_workload(
+        n_requests, max_new_tokens, arrival_rate_hz, seed, stagger=True,
+    )
+    print(f"budget: {n_blocks} blocks × {block_size} tokens "
+          f"= {n_blocks * block_size} token-slots")
+    print_workload(workload)
+
+    reserved = serve_with_block_budget(
+        rt, workload, n_blocks=n_blocks, mode="reserved", block_size=block_size,
+    )
+    paged = serve_with_block_budget(
+        rt, workload, n_blocks=n_blocks, mode="paged", block_size=block_size,
+    )
+
+    def _line(tag: str, d: dict) -> None:
+        print(
+            f"  {tag:<10}: completed {d['completed']:>2}/{d['n_requests']}  "
+            f"rejected {d['rejected']:>2}  "
+            f"peak_conc {d['peak_concurrent']:>2}  "
+            f"peak_blocks {d['peak_blocks_used']:>3}/{d['n_blocks']}"
+        )
+
+    print(f"--- n_blocks={n_blocks}  n_requests={n_requests}  max_new={max_new_tokens} ---")
+    _line("reserved", reserved)
+    _line("paged", paged)
+    return reserved, paged
+
+
 if __name__ == "__main__":
     pool = BlockPool(n_blocks=10, block_size=16)
     print_pool(pool, "start")
@@ -325,7 +579,9 @@ if __name__ == "__main__":
     print_pool(pool, "after release")
 
     print()
-    print("On GPU, verify Block 2:")
+    print("On GPU:")
     print("  from engine import load")
-    print("  from engine.paged import check_paged_matches_cached")
-    print("  assert check_paged_matches_cached(load())")
+    print("  from engine.paged import check_paged_matches_cached, compare_block_budget")
+    print("  rt = load()")
+    print("  assert check_paged_matches_cached(rt)")
+    print("  compare_block_budget(rt, n_blocks=32, n_requests=16, max_new_tokens=64)")

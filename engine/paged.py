@@ -519,6 +519,30 @@ def serve_with_block_budget(
     }
 
 
+def _budget_result_row(d: dict, *, max_new_tokens: int, arrival_rate_hz: float,
+                       seed: int, source: str | None = None) -> dict:
+    """Compact row for benchmarks/results.json (drop per-request lists)."""
+    row = {
+        "milestone": 5,
+        "label": d["label"],
+        "mode": d["mode"],
+        "n_blocks": d["n_blocks"],
+        "block_size": d["block_size"],
+        "n_requests": d["n_requests"],
+        "max_new_tokens": max_new_tokens,
+        "arrival_rate_hz": arrival_rate_hz,
+        "seed": seed,
+        "completed": d["completed"],
+        "rejected": d["rejected"],
+        "peak_concurrent": d["peak_concurrent"],
+        "peak_blocks_used": d["peak_blocks_used"],
+        "total_s": d["total_s"],
+    }
+    if source:
+        row["source"] = source
+    return row
+
+
 def compare_block_budget(
     rt: Runtime,
     n_blocks: int = 32,
@@ -528,7 +552,10 @@ def compare_block_budget(
     seed: int = 0,
     block_size: int = BLOCK_SIZE,
 ) -> tuple[dict, dict]:
-    """Same workload + same pool size: reserved vs paged admission."""
+    """Same workload + same pool size: reserved vs paged admission.
+
+    Returns two compact result dicts ready for engine.results.save().
+    """
     from engine.continuous import make_workload, print_workload
 
     workload = make_workload(
@@ -538,11 +565,20 @@ def compare_block_budget(
           f"= {n_blocks * block_size} token-slots")
     print_workload(workload)
 
-    reserved = serve_with_block_budget(
+    reserved_raw = serve_with_block_budget(
         rt, workload, n_blocks=n_blocks, mode="reserved", block_size=block_size,
     )
-    paged = serve_with_block_budget(
+    paged_raw = serve_with_block_budget(
         rt, workload, n_blocks=n_blocks, mode="paged", block_size=block_size,
+    )
+
+    reserved = _budget_result_row(
+        reserved_raw, max_new_tokens=max_new_tokens,
+        arrival_rate_hz=arrival_rate_hz, seed=seed,
+    )
+    paged = _budget_result_row(
+        paged_raw, max_new_tokens=max_new_tokens,
+        arrival_rate_hz=arrival_rate_hz, seed=seed,
     )
 
     def _line(tag: str, d: dict) -> None:
@@ -557,6 +593,31 @@ def compare_block_budget(
     _line("reserved", reserved)
     _line("paged", paged)
     return reserved, paged
+
+
+def sweep_block_budget(
+    rt: Runtime,
+    block_budgets=(16, 32, 48, 64),
+    n_requests: int = 16,
+    max_new_tokens: int = 64,
+    arrival_rate_hz: float = 8.0,
+    seed: int = 0,
+    block_size: int = BLOCK_SIZE,
+) -> list[dict]:
+    """Compare reserved vs paged across several pool sizes; rows for save()."""
+    results: list[dict] = []
+    for n_blocks in block_budgets:
+        reserved, paged = compare_block_budget(
+            rt,
+            n_blocks=n_blocks,
+            n_requests=n_requests,
+            max_new_tokens=max_new_tokens,
+            arrival_rate_hz=arrival_rate_hz,
+            seed=seed,
+            block_size=block_size,
+        )
+        results.extend([reserved, paged])
+    return results
 
 
 if __name__ == "__main__":
@@ -582,6 +643,8 @@ if __name__ == "__main__":
     print("On GPU:")
     print("  from engine import load")
     print("  from engine.paged import check_paged_matches_cached, compare_block_budget")
+    print("  from engine.results import save")
     print("  rt = load()")
     print("  assert check_paged_matches_cached(rt)")
-    print("  compare_block_budget(rt, n_blocks=32, n_requests=16, max_new_tokens=64)")
+    print("  r, p = compare_block_budget(rt, n_blocks=32, n_requests=16, max_new_tokens=64)")
+    print("  save([r, p])")

@@ -4,6 +4,7 @@
   python scripts/run_benchmark.py --milestone 1 2 --max-new-tokens 400
   python scripts/run_benchmark.py --milestone 3 --batch-sizes 1 2 4 8 16 32 64 128 256
   python scripts/run_benchmark.py --milestone 4 --slot-sizes 2 4 8 16 --n-requests 32
+  python scripts/run_benchmark.py --milestone 5 --block-budgets 16 32 48 64 --n-requests 16
 """
 
 import argparse
@@ -17,6 +18,7 @@ from engine.continuous import (
     sweep_continuous,
 )
 from engine.naive import measure_naive, warmup
+from engine.paged import check_paged_matches_cached, sweep_block_budget
 from engine.prompts import BATCH, LONG, SHORT
 from engine.results import report, save
 
@@ -28,6 +30,7 @@ def main():
     ap.add_argument("--batch-sizes", type=int, nargs="+",
                     default=[1, 2, 4, 8, 16, 32, 64, 128, 256])
     ap.add_argument("--slot-sizes", type=int, nargs="+", default=[2, 4, 8, 16])
+    ap.add_argument("--block-budgets", type=int, nargs="+", default=[16, 32, 48, 64])
     ap.add_argument("--n-requests", type=int, default=32)
     ap.add_argument("--arrival-rate-hz", type=float, default=8.0)
     ap.add_argument("--model", default=None)
@@ -66,13 +69,26 @@ def main():
         if not args.skip_checks:
             assert check_run_one_matches_cached(rt), "run_one diverged from cached"
             assert check_decode_batch_matches_run_one(rt), "decode_batch diverged"
-        # Milestone 4 uses shorter gens by default for a fair static-vs-continuous compare.
         m4_tokens = args.max_new_tokens if args.max_new_tokens != 400 else 64
         results.extend(sweep_continuous(
             rt,
             slot_sizes=tuple(args.slot_sizes),
             n_requests=args.n_requests,
             max_new_tokens=m4_tokens,
+            arrival_rate_hz=args.arrival_rate_hz,
+        ))
+
+    if 5 in args.milestone:
+        print("=== milestone 5: paged KV cache ===")
+        if not args.skip_checks:
+            assert check_paged_matches_cached(rt), "paged diverged from cached"
+        m5_tokens = args.max_new_tokens if args.max_new_tokens != 400 else 64
+        m5_n = args.n_requests if args.n_requests != 32 else 16
+        results.extend(sweep_block_budget(
+            rt,
+            block_budgets=tuple(args.block_budgets),
+            n_requests=m5_n,
+            max_new_tokens=m5_tokens,
             arrival_rate_hz=args.arrival_rate_hz,
         ))
 

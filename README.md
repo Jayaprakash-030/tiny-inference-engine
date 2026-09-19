@@ -58,8 +58,13 @@ continuous scheduling; compare tok/s, wait, latency, and slot utilization.
 *Results: see benchmarks/results.json (milestone 4 rows) and notebooks/04_continuous_batching.ipynb*
 
 ### 5. Paged KV cache
-*Not started.* Fixed-size blocks and a block table, instead of one contiguous
-allocation per sequence.
+Fixed-size KV blocks plus a block table. Under the same block budget, **reserved**
+admission (prompt + max_new up front) rejects work that **paged** admission
+(grow-as-you-go) can still serve.
+
+  python scripts/run_benchmark.py --milestone 5 --block-budgets 16 32 48 64 --n-requests 16 --max-new-tokens 64
+
+*Results: see benchmarks/results.json (milestone 5 rows) and notebooks/05_paged_attention.ipynb*
 
 ### 6. Prefix caching
 *Not started.* Reuse cache across requests that share a prompt prefix.

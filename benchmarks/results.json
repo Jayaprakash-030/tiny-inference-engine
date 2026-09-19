@@ -26,5 +26,37 @@
     "mean_latency_ms": 3234.96,
     "slot_util_pct": 84.1,
     "source": "colab_t4_smoke_pair"
+  },
+  {
+    "milestone": 5,
+    "label": "reserved_blocks_32",
+    "mode": "reserved",
+    "n_blocks": 32,
+    "block_size": 16,
+    "n_requests": 16,
+    "max_new_tokens": 64,
+    "arrival_rate_hz": 8.0,
+    "seed": 0,
+    "completed": 11,
+    "rejected": 5,
+    "peak_concurrent": 11,
+    "peak_blocks_used": 32,
+    "source": "colab_t4_m5_budget32"
+  },
+  {
+    "milestone": 5,
+    "label": "paged_blocks_32",
+    "mode": "paged",
+    "n_blocks": 32,
+    "block_size": 16,
+    "n_requests": 16,
+    "max_new_tokens": 64,
+    "arrival_rate_hz": 8.0,
+    "seed": 0,
+    "completed": 16,
+    "rejected": 0,
+    "peak_concurrent": 16,
+    "peak_blocks_used": 30,
+    "source": "colab_t4_m5_budget32"
   }
 ]

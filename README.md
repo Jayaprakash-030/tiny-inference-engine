@@ -90,7 +90,7 @@ front; **paged** grows on decode and preempts with `oom_grow` if the pool is emp
 
 [Plot: reserved vs paged](benchmarks/plots/m5_paged_kv.png)
 
-| n_blocks | reserved done/rej | paged done/rej | paged peak blocks |
+| n_blocks | reserved done/rejected | paged done/rejected | paged peak blocks |
 |---------:|------------------:|---------------:|------------------:|
 | 16 | 6 / 10 | 10 / 6 | 16/16 |
 | 32 | 11 / 5 | 16 / 0 | 28/32 |

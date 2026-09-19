@@ -359,7 +359,9 @@ def serve_with_block_budget(
                      at a time during decode; free everything on finish.
 
     Requests that cannot be admitted when they arrive are rejected (not queued
-    forever) so the metric is "how many fit in this budget".
+    forever). In paged mode a sequence may also be preempted mid-decode if the
+    pool has no free block when its KV needs to grow — that is the tight-budget
+    story, not a crash.
     """
     if mode not in ("paged", "reserved"):
         raise ValueError("mode must be 'paged' or 'reserved'")
@@ -433,8 +435,13 @@ def serve_with_block_budget(
         _note_peaks()
         return True
 
+    def _can_append_one(live: _Live) -> bool:
+        """True if writing one more KV token fits without a new free block, or one is free."""
+        need = blocks_needed(live.bt.seq_len + 1, block_size)
+        extra = need - live.bt.n_blocks
+        return extra <= 0 or pool.n_free >= extra
+
     def _decode_one_live(live: _Live) -> float:
-        nonlocal server_ms
         rt.sync()
         t0 = time.perf_counter()
         gathered = live.bt.gather_cache()
@@ -459,6 +466,17 @@ def serve_with_block_budget(
             return True
         return False
 
+    def _preempt(live: _Live, reason: str) -> None:
+        rejected.append({
+            "req_id": live.req.req_id,
+            "arrival_ms": live.req.arrival_ms,
+            "limit": live.req.max_new_tokens,
+            "reason": reason,
+            "gen_tokens": live.n_gen,
+            "free_at_reject": pool.n_free,
+        })
+        live.bt.release()
+
     while qi < len(waiting) or active:
         # ADMIT
         while qi < len(waiting) and len(active) < slot_cap:
@@ -481,14 +499,15 @@ def serve_with_block_budget(
             server_ms = max(server_ms, waiting[qi].arrival_ms)
             continue
 
-        # DECODE each active seq once (sequential; memory story is what matters here)
-        for live in active:
-            server_ms += _decode_one_live(live)
-        _note_peaks()
-
-        # EVICT
+        # DECODE + EVICT (sequential; memory story is what matters here).
+        # Paged can over-admit relative to max length; if a seq needs a new
+        # block and the pool is empty, preempt it and free its blocks.
         still: list[_Live] = []
         for live in active:
+            if not _can_append_one(live):
+                _preempt(live, "oom_grow")
+                continue
+            server_ms += _decode_one_live(live)
             if _finished(live):
                 completed.append({
                     "req_id": live.req.req_id,
@@ -500,6 +519,7 @@ def serve_with_block_budget(
             else:
                 still.append(live)
         active = still
+        _note_peaks()
 
     # Anything never reached because we stopped? (shouldn't happen)
     return {

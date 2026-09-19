@@ -60,7 +60,9 @@ continuous scheduling; compare tok/s, wait, latency, and slot utilization.
 ### 5. Paged KV cache
 Fixed-size KV blocks plus a block table. Under the same block budget, **reserved**
 admission (prompt + max_new up front) rejects work that **paged** admission
-(grow-as-you-go) can still serve.
+(prompt-only, grow on decode) can still serve — until a tight pool forces
+`oom_grow` preempts mid-decode. Under the same budget, paged usually completes
+more requests; reserved wastes reserved tail slots.
 
   python scripts/run_benchmark.py --milestone 5 --block-budgets 16 32 48 64 --n-requests 16 --max-new-tokens 64
 
